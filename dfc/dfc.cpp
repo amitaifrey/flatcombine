@@ -33,10 +33,10 @@ using namespace std::literals::chrono_literals;
 #endif
 
 #ifndef DATA_FILE
-#define DATA_FILE "../data/green-pstack-ll-dfc.txt"
+#define DATA_FILE "log"
 #endif
 #ifndef PDATA_FILE
-#define PDATA_FILE "../data/pwb-pfence-dfc.txt"
+#define PDATA_FILE "report"
 #endif
 #ifndef PM_REGION_SIZE
 #define PM_REGION_SIZE 1024*1024*1024ULL // 1GB for now
@@ -48,7 +48,8 @@ using namespace std::literals::chrono_literals;
 // #define PM_FILE_NAME   "/home/matanr/recov_flat_combining/poolfile"
 // #define PM_FILE_NAME   "/dev/shm/dfc_shared"
 // #define PM_FILE_NAME   "/dev/dax4.0"
-#define PM_FILE_NAME   "/mnt/dfcpmem/dfc_shared"
+// #define PM_FILE_NAME   "/mnt/dfcpmem/dfc_shared"
+#define PM_FILE_NAME   "data"
 #endif
 
 // #define N 8  // number of processes
@@ -852,22 +853,22 @@ int recoveryTest() {
 
 		std::cout << "printing before recovering" << std::endl;
 		print_state(proot->dfc);
-		
+
         for (int pid=0; pid<NN; pid++) {
             threads_pool[pid] = std::thread (recover, proot->dfc, pop, pid, ops[pid], params[pid]);
-        }							      
+        }
 		for (int pid=0; pid<NN; pid++) {
 			threads_pool[pid].join();
 		}
 		print_state(proot->dfc);
 		std::cout << "finished printing after recovering" << std::endl;
-		
-		
+
+
 		for (int pid=0; pid<NN; pid++) {
-			char nextOp = 1 - proot->dfc->announce_arr[pid]->valid % 10;	
-			ANN(proot->dfc, pid, nextOp)->epoch = NONE; // change the last field: 
+			char nextOp = 1 - proot->dfc->announce_arr[pid]->valid % 10;
+			ANN(proot->dfc, pid, nextOp)->epoch = NONE; // change the last field:
             threads_pool[pid] = std::thread (op, proot->dfc, pop, pid, ops[pid], params[pid]);
-        }							      
+        }
 		for (int pid=0; pid<NN; pid++) {
 			threads_pool[pid].join();
 		}
@@ -876,7 +877,7 @@ int recoveryTest() {
 		transaction_deallocations(proot, pop);
 		/* Cleanup */
 		/* Close persistent pool */
-		pop.close ();	
+		pop.close ();
 		std::remove(pool_file_name);
 		return 1;
 	}
@@ -887,11 +888,11 @@ int recoveryTest() {
 		proot = pop.root();
 		transaction_allocations(proot, pop);
 		std::cout << "Finished allocating!" << std::endl;
-		
+
 		for (int pid=0; pid<NN; pid++) {
-			char nextOp = 1 - proot->dfc->announce_arr[pid]->valid % 10;	
-			// ANN(proot->dfc, pid, nextOp)->epoch = NONE; 
-			ANN(proot->dfc, pid, nextOp)->name = NONE; 
+			char nextOp = 1 - proot->dfc->announce_arr[pid]->valid % 10;
+			// ANN(proot->dfc, pid, nextOp)->epoch = NONE;
+			ANN(proot->dfc, pid, nextOp)->name = NONE;
             threads_pool[pid] = std::thread (op, proot->dfc, pop, pid, ops[pid], params[pid]);
         }
 		// usleep(1);
@@ -906,7 +907,7 @@ int recoveryTest() {
 
 
 int main(int argc, char *argv[]) {
-	
+
 	// recoveryTest();
 	runSeveralTests();
 }
