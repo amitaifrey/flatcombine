@@ -25,12 +25,14 @@ using namespace pmem::obj;
 using namespace std::chrono;
 using namespace std::literals::chrono_literals;
 
+#define RANDOP
+
 #ifdef SAME100_BENCH
 #define DATA_FILE "../data/same100-green-pstack-ll-dfc.txt"
 #define PDATA_FILE "../data/same100-pwb-pfence-dfc.txt"
 #elif defined RANDOP
-#define DATA_FILE "../data/randop-green-pstack-ll-dfc.txt"
-#define PDATA_FILE "../data/randop-pwb-pfence-dfc.txt"
+//#define DATA_FILE "../data/randop-green-pstack-ll-dfc.txt"
+//#define PDATA_FILE "../data/randop-pwb-pfence-dfc.txt"
 #endif
 
 #ifndef DATA_FILE
@@ -50,7 +52,7 @@ using namespace std::literals::chrono_literals;
 // #define PM_FILE_NAME   "/dev/shm/dfc_shared"
 // #define PM_FILE_NAME   "/dev/dax4.0"
 // #define PM_FILE_NAME   "/mnt/dfcpmem/dfc_shared"
-#define PM_FILE_NAME   "data"
+#define PM_FILE_NAME   "/mnt/ram/data"
 #endif
 
 // #define N 8  // number of processes
@@ -259,40 +261,28 @@ void transaction_deallocations(persistent_ptr<root> proot, pmem::obj::pool<root>
     });
 }
 
-size_t lock_taken(persistent_ptr<detectable_fc> dfc, size_t &opEpoch, bool combiner, size_t pid) {
-    if (combiner == false) {
+size_t try_to_take_lock(persistent_ptr<detectable_fc> dfc, size_t &opEpoch, size_t pid) {
+    bool expected = false;
+    while (cLock.compare_exchange_strong(expected, true) == false) {
+        expected = false;
+        bool breaked = false;
         while (dfc->cEpoch <= opEpoch + 1) {
             // std::this_thread::yield(); // without: faster on threads <= cores. with: keeps scaling even after threads > cores
             if (cLock.load(std::memory_order_acquire) == false && dfc->cEpoch <= opEpoch + 1) {
-                return try_to_take_lock(dfc, opEpoch, pid);
+                breaked = true;
+                break;
             }
         }
-        return try_to_return(dfc, opEpoch, pid);
+        if (breaked) continue;
+        size_t val = VALID_ANN(dfc, pid)->val;
+        if (val == NONE) {
+            opEpoch += 2;
+            continue;
+        } else {
+            return val;
+        }
     }
     return NONE;
-}
-
-size_t try_to_take_lock(persistent_ptr<detectable_fc> dfc, size_t &opEpoch, size_t pid) {
-    bool expected = false;
-    bool combiner = cLock.compare_exchange_strong(expected, true);
-    return lock_taken(dfc, opEpoch, combiner, pid);
-}
-
-size_t try_to_return(persistent_ptr<detectable_fc> dfc, size_t &opEpoch, size_t pid) {
-    // size_t val = dfc->announce_arr[pid]->val;
-//    size_t val = VALID_ANN(dfc, pid)->val;
-//    if (val == NONE) {
-//        opEpoch += 2;
-//        std::cout << "Lock: val is NONE" << std::endl;
-//        return try_to_take_lock(dfc, opEpoch, pid);
-//    } else {
-//        std::cout << "Lock: val is val" << std::endl;
-//        return val;
-//    }
-    opEpoch += 2;
-    bool expected = true;
-    bool combiner = cLock.compare_exchange_strong(expected, false);
-    return 6;
 }
 
 std::pair<int, int> reduce(persistent_ptr<detectable_fc> dfc) {
@@ -311,12 +301,12 @@ std::pair<int, int> reduce(persistent_ptr<detectable_fc> dfc) {
                 // PWB(&ANN(dfc, i, validOp)->epoch);  // needed if there is a chance that epoch will be persisted but val not
                 char opName = ANN(dfc, i, validOp)->name;
                 if (opName == PUSH_OP) {
-                    top_push++;
                     pushList[top_push] = i;
+                    top_push++;
                     collectedValid[i] = validOp;
                 } else if (opName == POP_OP) {
-                    top_pop++;
                     popList[top_pop] = i;
+                    top_pop++;
                     collectedValid[i] = validOp;
                 }
             } else {
@@ -405,6 +395,7 @@ size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::poo
     persistent_ptr<node> head = dfc->top[(opEpoch / 2) % 2];
     for (int i = 0; i < push_size; ++i) {
         size_t cId = pushList[i];
+
         uint64_t pos = -1;
 
         uint64_t n = free_nodes_log_h1;
@@ -424,7 +415,7 @@ size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::poo
         }
         auto newNode = dfc->nodes_pool[pos];
         short validOp = collectedValid[cId];
-        size_t newParam = ANN(dfc, cId, PUSH_OP)->param;
+        size_t newParam = ANN(dfc, cId, validOp)->param;
         newNode->param = newParam;
         newNode->next = head;
 
@@ -443,8 +434,7 @@ size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::poo
             mask = 1UL << p;
             free_nodes_log_h1 = (n & ~mask) | ((b << p) & mask);
         }
-
-        ANN(dfc, cId, PUSH_OP)->val = ACK;
+        ANN(dfc, cId, validOp)->val = ACK;
         // pwbCounter3 ++;
         PWB(&newNode);
         head = newNode;
@@ -453,14 +443,13 @@ size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::poo
     for (int i = 0; i < pop_size; ++i) {
         size_t cId = popList[i];
         if (head == NULL) {
-            ANN(dfc, cId, POP_OP)->val = EMPTY;
-            std::cout << "Popping on empty" << std::endl;
+            ANN(dfc, cId, collectedValid[cId])->val = EMPTY;
             // exit(-1);
         } else {
 
             size_t headParam = head->param;
+            ANN(dfc, cId, collectedValid[cId])->val = headParam;
 
-            ANN(dfc, cId, POP_OP)->val = headParam;
             uint64_t i = head->index;
             uint64_t n = free_nodes_log[i / 64];
             uint64_t firstSetBit = log2(n & -n);
@@ -499,9 +488,9 @@ size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::poo
     dfc->cEpoch = dfc->cEpoch + 1;
     // PWB(&dfc->cEpoch);
     // PFENCE();
+    //size_t value = try_to_return(dfc, opEpoch, pid);
     cLock.store(false, std::memory_order_release);
-    size_t value = try_to_return(dfc, opEpoch, pid);
-    return value;
+    return VALID_ANN(dfc, pid)->val;
 }
 
 
@@ -762,7 +751,7 @@ pushPopTest(int numThreads, const long numPairs, const int numRuns, const int nu
 int runSeveralTests() {
     const std::string dataFilename{DATA_FILE};
     const std::string pdataFilename{PDATA_FILE};
-    std::vector<int> threadList = { 2, 4, 8, 10, 16, 24, 32, 40};     // For Castor
+    std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 24, 32, 40};     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40};     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 64, 68, 72, 76, 80 };     // For Castor
     const int numRuns = 10;                                           // Number of runs
@@ -806,12 +795,11 @@ int runSeveralTests() {
     pdataFile.open(pdataFilename);
     pdataFile << "Threads\t";
     // Printf class names for each column
-    pdataFile << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t"
-              << "DFC-COMBINING" << "\t";
+    pdataFile << "OPS/Sec\t" << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t";
     pdataFile << "\n";
     for (int it = 0; it < threadList.size(); it++) {
         pdataFile << threadList[it] << "\t";
-        pdataFile << std::get<1>(results[it]) << "\t";
+        pdataFile << std::get<0>(results[it]) << "\t";
         pdataFile << std::get<2>(results[it]) << "\t";
         pdataFile << std::get<3>(results[it]) << "\t";
         pdataFile << std::get<4>(results[it]) << "\t";

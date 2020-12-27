@@ -34,6 +34,63 @@
 #define NONE -3
 #define PUSH_OP 1
 #define POP_OP 0
+#define SIZE 10000
+
+// Macros needed for persistence
+#ifdef PWB_IS_CLFLUSH_PFENCE_NOP
+/*
+   * More info at http://elixir.free-electrons.com/linux/latest/source/arch/x86/include/asm/special_insns.h#L213
+   * Intel programming manual at https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf
+   * Use these for Broadwell CPUs (cervino server)
+   */
+  #define PWB(addr)              __asm__ volatile("clflush (%0)" :: "r" (addr) : "memory")                      // Broadwell only works with this.
+  #define PFENCE()               {}                                                                             // No ordering fences needed for CLFLUSH (section 7.4.6 of Intel manual)
+  #define PSYNC()                {}
+  #define PPWB(addr)              __asm__ volatile("clflush (%0)" :: "r" (addr) : "memory")  // parallel PWB
+  #define PPFENCE()               {} // parallel PFENCE
+#elif PWB_IS_CLFLUSH
+#define PWB(addr)              __asm__ volatile("clflush (%0)" :: "r" (addr) : "memory")
+  #define PFENCE()               __asm__ volatile("sfence" : : : "memory")
+  #define PSYNC()                __asm__ volatile("sfence" : : : "memory")
+  #define PPWB(addr)              __asm__ volatile("clflush (%0)" :: "r" (addr) : "memory") // parallel PWB
+  #define PPFENCE()               __asm__ volatile("sfence" : : : "memory") // parallel PFENCE
+#elif PWB_IS_CLWB
+/* Use this for CPUs that support clwb, such as the SkyLake SP series (c5 compute intensive instances in AWS are an example of it) */
+  #define PWB(addr)              __asm__ volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)))  // clwb() only for Ice Lake onwards
+  #define PFENCE()               __asm__ volatile("sfence" : : : "memory")
+  #define PSYNC()                __asm__ volatile("sfence" : : : "memory")
+  #define PPWB(addr)              __asm__ volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr))) // parallel PWB
+  #define PPFENCE()               __asm__ volatile("sfence" : : : "memory") // parallel PFENCE
+#elif PWB_IS_NOP
+/* pwbs are not needed for shared memory persistency (i.e. persistency across process failure) */
+  #define PWB(addr)              {}
+  #define PFENCE()               __asm__ volatile("sfence" : : : "memory")
+  #define PSYNC()                __asm__ volatile("sfence" : : : "memory")
+  #define PPWB(addr)              {} // parallel PWB
+  #define PPFENCE()               __asm__ volatile("sfence" : : : "memory") // parallel PFENCE
+#elif PWB_IS_CLFLUSHOPT
+/* Use this for CPUs that support clflushopt, which is most recent x86 */
+  #define PWB(addr)              __asm__ volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *)(addr)))    // clflushopt (Kaby Lake)
+  #define PFENCE()               __asm__ volatile("sfence" : : : "memory")
+  #define PSYNC()                __asm__ volatile("sfence" : : : "memory")
+  #define PPWB(addr)             __asm__ volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *)(addr))) // parallel PWB
+  #define PPFENCE()              __asm__ volatile("sfence" : : : "memory") // parallel PFENCE
+#elif PWB_IS_PMEM
+#define PWB(addr)              pmem_flush(addr, sizeof(addr))
+  #define PFENCE()               pmem_drain()
+  #define PSYNC() 				 {}
+  #define PPWB(addr)              pmem_flush(addr, sizeof(addr)) // parallel PWB
+  #define PPFENCE()               pmem_drain() // parallel PFENCE
+#elif COUNT_PWB
+#define PWB(addr)              __asm__ volatile("clflush (%0)" :: "r" (addr) : "memory") ; localPwbCounter++
+#define PFENCE()               __asm__ volatile("sfence" : : : "memory") ; localPfenceCounter++
+#define PSYNC()                __asm__ volatile("sfence" : : : "memory")
+#define PPWB(addr)              __asm__ volatile("clflush (%0)" :: "r" (addr) : "memory") ; localParallelPwbCounter++
+#define PPFENCE()               __asm__ volatile("sfence" : : : "memory") ; localParallelPfenceCounter++
+#else
+#error "You must define what PWB is. Choose PWB_IS_CLFLUSHOPT if you don't know what your CPU is capable of"
+#endif
+
 
 using namespace std::chrono;
 
@@ -105,6 +162,11 @@ using pmem::obj::transaction;
 namespace examples
 {
 
+    struct queue_data {
+        p<int64_t> front, rear;
+        p<int64_t> data[SIZE];
+    };
+
 /*
  * Persistent memory list-based queue
  *
@@ -114,77 +176,114 @@ namespace examples
  */
     class pmem_queue {
 
-        /* entry in the list */
-        struct pmem_entry {
-            persistent_ptr<pmem_entry> next;
-            p<uint64_t> value;
-        };
-
     public:
         /*
          * Inserts a new element at the end of the queue.
          */
+
+        // Check if the queue is full
+        bool isFull() {
+            if (q->front == 0 && q->rear == SIZE - 1) {
+                return true;
+            }
+            if (q->front == q->rear + 1) {
+                return true;
+            }
+            return false;
+        }
+        // Check if the queue is empty
+        bool isEmpty() {
+            if (q->front == -1)
+                return true;
+            else
+                return false;
+        }
+
         void
-        push(pool_base &pop, uint64_t value)
+        push(uint64_t value)
         {
-            std::lock_guard<std::mutex>guard(mutex);
-            transaction::run(pop, [&] {
-                auto n = make_persistent<pmem_entry>();
-
-                n->value = value;
-                n->next = nullptr;
-
-                if (head == nullptr && tail == nullptr) {
-                    head = tail = n;
-                } else {
-                    tail->next = n;
-                    tail = n;
-                }
-            });
+            std::lock_guard<std::mutex>guard(*mutex);
+            if (isFull()) {
+                std::cout << "Queue is full";
+            } else {
+                if (q->front == -1) q->front = 0;
+                q->rear = (q->rear + 1) % SIZE;
+                q->data[q->rear] = value;
+                PWB(&q->data[q->rear]);
+                PWB(&q->rear);
+                PFENCE();
+                //std::cout << std::endl << "Inserted " << element << std::endl;
+            }
         }
 
         /*
          * Removes the first element in the queue.
          */
         uint64_t
-        pop(pool_base &pop)
+        pop()
         {
-            std::lock_guard<std::mutex>guard(mutex);
-            uint64_t ret = 0;
-            transaction::run(pop, [&] {
-                if (head == nullptr)
-                    transaction::abort(EINVAL);
-
-                ret = head->value;
-                auto n = head->next;
-
-                delete_persistent<pmem_entry>(head);
-                head = n;
-
-                if (head == nullptr)
-                    tail = nullptr;
-            });
-
-            return ret;
+            std::lock_guard<std::mutex>guard(*mutex);
+            int element;
+            if (isEmpty()) {
+                std::cout << "Queue is empty" << std::endl;
+                return (-1);
+            } else {
+                element = q->data[q->front];
+                if (q->front == q->rear) {
+                    q->front = -1;
+                    q->rear = -1;
+                    PWB(&q->rear);
+                }
+                    // Q has only one element,
+                    // so we reset the queue after deleting it.
+                else {
+                    q->front = (q->front + 1) % SIZE;
+                }
+                PWB(&q->front);
+                PFENCE();
+                return (element);
+            }
         }
 
         /*
          * Prints the entire contents of the queue.
          */
-        void
-        show(void) const
-        {
-            for (auto n = head; n != nullptr; n = n->next)
-                std::cout << n->value << std::endl;
+//        void
+//        show(void) const
+//        {
+//            for (auto n = head; n != nullptr; n = n->next)
+//                std::cout << n->value << std::endl;
+//        }
+
+        pmem_queue(pool<examples::queue_data>& pool_base, persistent_ptr<queue_data> data)  : p(pool_base), q(data) {
+            transaction::run(p, [&] {
+                q = make_persistent<queue_data>();
+                q->front = -1;
+                q->rear = -1;
+            });
+            mutex = std::make_shared<std::mutex>();
         }
 
+        pmem_queue() = default;
+
+        pmem_queue& operator=(const pmem_queue&) = default;
+
+//        ~pmem_queue() {
+//            transaction::run(p, [&] {
+//                delete_persistent<queue_data>(q);
+//            });
+//        }
+
     private:
-        persistent_ptr<pmem_entry> head;
-        persistent_ptr<pmem_entry> tail;
-        std::mutex mutex;
+        pool<examples::queue_data> p;
+        persistent_ptr<queue_data> q;
+        std::shared_ptr<std::mutex> mutex;
+
     };
 
 } /* namespace examples */
+
+
 
 static inline int
 file_exists(char const *file)
@@ -196,8 +295,11 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
     const uint64_t kNumElements = 0; // Number of initial items in the stack
     static const long long NSEC_IN_SEC = 1000000000LL;
 
-    pool<examples::pmem_queue> p;
-    persistent_ptr<examples::pmem_queue> q;
+    pool<examples::queue_data> p;
+    examples::pmem_queue q;
+//    auto p = pool<examples::queue_data>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
+//    examples::pmem_queue q(p, p.root());
+    //persistent_ptr<examples::pmem_queue> q(p.root());
 
     size_t params [N];
     size_t ops [N];
@@ -215,8 +317,8 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
         // Measurement phase
         auto startBeats = steady_clock::now();
         for (long long iter = 0; iter < numPairs/numThreads; iter++) {
-            q->push(p, 6);
-            if (q->pop(p) != 6) std::cout << "Error at measurement pop() iter=" << iter << "\n";
+            q.push(6);
+            if (q.pop() != 6) std::cout << "Error at measurement pop() iter=" << iter << "\n";
         }
         auto stopBeats = steady_clock::now();
         *delta = stopBeats - startBeats;
@@ -236,10 +338,10 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
         auto startBeats = steady_clock::now();
         for (long long iter = 0; iter < numPairs/(numThreads*numSameOps); iter++) {
             for (long iter_s = 0; iter_s < numSameOps; iter_s++) {
-                q->push(p, param);
+                q.push(param);
             }
             for (long iter_s = 0; iter_s < numSameOps; iter_s++) {
-                q->push(p, param);
+                q.push(param);
             }
         }
         auto stopBeats = steady_clock::now();
@@ -261,10 +363,10 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
         for (long long iter = 0; iter < 2 * numPairs/numThreads; iter++) {
             int randop = rand() % 2;         // randop in the range 0 to 1
             if (randop == 0) {
-                q->push(p, param);
+                q.push(param);
             }
             else if (randop == 1) {
-                q->pop(p);
+                q.pop();
             }
         }
         auto stopBeats = steady_clock::now();
@@ -280,15 +382,17 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
     for (int irun = 0; irun < numRuns; irun++) {
         NN = numThreads;
 
-        p = pool<examples::pmem_queue>::create("data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
-        q = p.root();
+//        p = pool<examples::pmem_queue>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
+//        q = p.root();
 //        transaction_allocations(q, p);
+        p = pool<examples::queue_data>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
+        q = examples::pmem_queue(p, p.root());
         std::cout << "Finished allocating!" << std::endl;
 
         // Fill the queue with an initial amount of nodes
         size_t param = size_t(41);
         for (uint64_t ielem = 0; ielem < kNumElements; ielem++) {
-            q->push(p, param);
+            q.push(param);
         }
 
         std::thread enqdeqThreads[numThreads];
@@ -310,7 +414,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
         /* Cleanup */
         /* Close persistent pool */
         p.close ();
-        std::remove("data");
+        std::remove("/mnt/ram/data");
     }
 
     // Sum up all the time deltas of all threads so we can find the median run
@@ -353,7 +457,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 
 int runSeveralTests() {
     const std::string dataFilename { "log" };
-    const std::string pdataFilename { "results" };
+    const std::string pdataFilename { "report" };
     std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 24, 32, 40 };     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40};     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 64, 68, 72, 76, 80 };     // For Castor
@@ -397,10 +501,11 @@ int runSeveralTests() {
     pdataFile.open(pdataFilename);
     pdataFile << "Threads\t";
     // Printf class names for each column
-    pdataFile << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t";
+    pdataFile << "OPS/Sec\t" << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t";
     pdataFile << "\n";
     for (int it = 0; it < threadList.size(); it++) {
         pdataFile << threadList[it] << "\t";
+        pdataFile << std::get<0>(results[it]) << "\t";
         pdataFile << std::get<1>(results[it]) << "\t";
         pdataFile << std::get<2>(results[it]) << "\t";
         pdataFile << std::get<3>(results[it]) << "\t";
@@ -434,7 +539,7 @@ int old_main(int argc, char *argv[])
     queue_op op = parse_queue_op(argv[2]);
 
     pool<examples::pmem_queue> pop;
-    persistent_ptr<examples::pmem_queue> q;
+    persistent_ptr<examples::pmem_queue> q(pop.root());
 
     try {
         if (file_exists(path) != 0) {
@@ -455,7 +560,7 @@ int old_main(int argc, char *argv[])
     switch (op) {
         case QUEUE_PUSH:
             try {
-                q->push(pop, std::stoull(argv[3]));
+                q->push(std::stoull(argv[3]));
             } catch (const std::runtime_error &e) {
                 std::cerr << "Exception: " << e.what()
                           << std::endl;
@@ -464,7 +569,7 @@ int old_main(int argc, char *argv[])
             break;
         case QUEUE_POP:
             try {
-                std::cout << q->pop(pop) << std::endl;
+                std::cout << q->pop() << std::endl;
             } catch (const std::runtime_error &e) {
                 std::cerr << "Exception: " << e.what()
                           << std::endl;
@@ -476,7 +581,7 @@ int old_main(int argc, char *argv[])
             }
             break;
         case QUEUE_SHOW:
-            q->show();
+            //q->show();
             break;
         default:
             std::cerr << "Invalid queue operation" << std::endl;

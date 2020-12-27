@@ -24,12 +24,14 @@ using namespace pmem::obj;
 using namespace std::chrono;
 using namespace std::literals::chrono_literals;
 
+#define RANDOP
+
 #ifdef SAME100_BENCH
 #define DATA_FILE "../data/same100-green-pstack-ll-dfc.txt"
 #define PDATA_FILE "../data/same100-pwb-pfence-dfc.txt"
 #elif defined RANDOP
-#define DATA_FILE "../data/randop-green-pstack-ll-dfc.txt"
-#define PDATA_FILE "../data/randop-pwb-pfence-dfc.txt"
+//#define DATA_FILE "../data/randop-green-pstack-ll-dfc.txt"
+//#define PDATA_FILE "../data/randop-pwb-pfence-dfc.txt"
 #endif
 
 #ifndef DATA_FILE
@@ -49,7 +51,7 @@ using namespace std::literals::chrono_literals;
 // #define PM_FILE_NAME   "/dev/shm/dfc_shared"
 // #define PM_FILE_NAME   "/dev/dax4.0"
 // #define PM_FILE_NAME   "/mnt/dfcpmem/dfc_shared"
-#define PM_FILE_NAME   "data"
+#define PM_FILE_NAME   "/mnt/ram/data"
 #endif
 
 // #define N 8  // number of processes
@@ -802,10 +804,11 @@ int runSeveralTests() {
     pdataFile.open(pdataFilename);
     pdataFile << "Threads\t";
     // Printf class names for each column
-    pdataFile << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t";
+    pdataFile << "OPS/Sec\t" << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t";
     pdataFile << "\n";
     for (int it = 0; it < threadList.size(); it++) {
         pdataFile << threadList[it] << "\t";
+        pdataFile << std::get<0>(results[it]) << "\t";
         pdataFile << std::get<1>(results[it]) << "\t";
         pdataFile << std::get<2>(results[it]) << "\t";
 		pdataFile << std::get<3>(results[it]) << "\t";
