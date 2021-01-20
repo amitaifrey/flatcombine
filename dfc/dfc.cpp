@@ -149,6 +149,18 @@ int pfenceParallelCounter = 0;
 thread_local int l_combining_counter = 0;
 int combining_counter = 0;
 
+double r_max_stack_size = 0;
+double r_stack_size_on_combine = 0;
+double r_current_stack_size = 0;
+double r_reduced = 0;
+double r_opsize = 0;
+double r_write = 0;
+
+double max_stack_size = 0;
+double stack_size_on_combine = 0;
+double reduced = 0;
+double opsize = 0;
+
 int pushList[N];
 int popList[N];
 short collectedValid[N];
@@ -337,6 +349,7 @@ int reduce(persistent_ptr<detectable_fc> dfc) {
 
 			top_push --;
 			top_pop --;
+			r_reduced ++;
 		}
 		else if (top_push != -1) {
 			return (top_push + 1);
@@ -401,7 +414,15 @@ void update_free_nodes(persistent_ptr<detectable_fc> dfc, size_t opEpoch) {
 size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::pool<root> pop, size_t pid) {
 	l_combining_counter ++;
 	int top_index = reduce(dfc);
-	persistent_ptr<node> head = dfc->top[(opEpoch/2)%2];
+    r_current_stack_size = std::max(0.0, r_current_stack_size + top_index);
+    r_max_stack_size = std::max(r_max_stack_size, r_current_stack_size);
+    r_stack_size_on_combine += r_current_stack_size;
+    if (top_index != 0) {
+        r_opsize += std::abs(top_index);
+        r_write++;
+    }
+
+    persistent_ptr<node> head = dfc->top[(opEpoch/2)%2];
 	if (top_index != 0) {
 		if (top_index > 0) { // push
 			top_index = top_index - 1;
@@ -595,7 +616,7 @@ inline bool is_file_exists (const char* name) {
  * enqueue-dequeue pairs: in each iteration a thread executes an enqueue followed by a dequeue;
  * the benchmark executes 10^8 pairs partitioned evenly among all threads;
  */
-std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int numThreads, const long numPairs, const int numRuns, const int numSameOps) {
+std::tuple<uint64_t, double, double, double, double, double, double, double, double, double> pushPopTest(int numThreads, const long numPairs, const int numRuns, const int numSameOps) {
 	const uint64_t kNumElements = 0; // Number of initial items in the stack
 	static const long long NSEC_IN_SEC = 1000000000LL;
 	
@@ -620,7 +641,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		// Measurement phase
 		auto startBeats = steady_clock::now();
 		for (long long iter = 0; iter < numPairs/numThreads; iter++) {
-			op(proot->dfc, pop, tid, PUSH_OP, param);
+            op(proot->dfc, pop, tid, PUSH_OP, param);
 			if (op(proot->dfc, pop, tid, POP_OP, NONE) == EMPTY) std::cout << "Error at measurement pop() iter=" << iter << "\n";
 		}
 		auto stopBeats = steady_clock::now();
@@ -631,6 +652,10 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		pwbParallelCounter += localParallelPwbCounter;
 		pfenceParallelCounter += localParallelPfenceCounter;
 		combining_counter += l_combining_counter;
+        max_stack_size += double(r_max_stack_size) / double(numThreads);
+        stack_size_on_combine += double(r_stack_size_on_combine) / double(numThreads);
+        reduced += double(2 * r_reduced / numThreads);
+        opsize += r_opsize / (double(numThreads)*r_write);
 	};
 
 	auto pushpop_k_lambda = [&numThreads, &startFlag,&numPairs, &numSameOps, &proot, &pop](nanoseconds *delta, const int tid) {
@@ -655,6 +680,10 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		pwbParallelCounter += localParallelPwbCounter;
 		pfenceParallelCounter += localParallelPfenceCounter;
 		combining_counter += l_combining_counter;
+        max_stack_size += double(r_max_stack_size) / double(numThreads);
+        stack_size_on_combine += double(r_stack_size_on_combine) / double(numThreads);
+        reduced += double(2 * r_reduced / numThreads);
+        opsize += r_opsize / (double(numThreads)*r_write);
 	};
 
 	auto randop_lambda = [&numThreads, &startFlag,&numPairs, &proot, &pop](nanoseconds *delta, const int tid) {
@@ -680,10 +709,15 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		pwbParallelCounter += localParallelPwbCounter;
 		pfenceParallelCounter += localParallelPfenceCounter;
 		combining_counter += l_combining_counter;
+        max_stack_size += double(r_max_stack_size) / double(numThreads);
+        stack_size_on_combine += double(r_stack_size_on_combine) / double(numThreads);
+        reduced += double(2 * r_reduced / numThreads);
+        opsize += r_opsize / (double(numThreads)*r_write);
 	};
 
 	for (int irun = 0; irun < numRuns; irun++) {
 		NN = numThreads;
+        r_stack_size_on_combine = 0; r_max_stack_size = 0; r_current_stack_size = 0; r_reduced = 0; r_opsize = 0; r_write = 0;
 		
 		pop = pool<root>::create(pool_file_name, "layout", (size_t)PM_REGION_SIZE, S_IRUSR|S_IWUSR);
 		proot = pop.root();
@@ -738,11 +772,19 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		double pwbParallelPerOp = double(pwbParallelCounter) / double(numPairs*2);
 		double pfenceParallelPerOp = double(pfenceParallelCounter) / double(numPairs*2);
 		double combiningPerOp = double(combining_counter) / double(numPairs*2);
+        double average_stack_size = double(stack_size_on_combine) / double(combining_counter);
+        double final_max = double(max_stack_size) / numRuns;
+        double final_reduced = reduced / (numRuns * double(numPairs*2));
+        double final_opsize = opsize / numRuns;
 		std::cout << "#pwb/#op: " << std::fixed << pwbPerOp;
 		std::cout << ", #pfence/#op: " << std::fixed << pfencePerOp;
 		std::cout << ", T #pwb/#op: " << std::fixed << pwbPerOp + pwbParallelPerOp;
 		std::cout << ", T #pfence/#op: " << std::fixed << pfencePerOp + pfenceParallelPerOp; 
-		std::cout << ", #combining/#op: " << std::fixed << combiningPerOp << std::endl;
+		std::cout << ", #combining/#op: " << std::fixed << combiningPerOp;
+        std::cout << ", max stack size: " << std::fixed << final_max;
+        std::cout << ", average stack size: " << std::fixed << average_stack_size;
+        std::cout << ", average reduced percent: " << std::fixed << final_reduced;
+        std::cout << ", average pmem op size: " << std::fixed << final_opsize << std::endl;
 		// std::cout << ", Total #pwb/#op (parallel PWBs included): " << std::fixed << pwbPerOp + pwbParallelPerOp;
 		// std::cout << "#Total pfence/#op (parallel PFENCEs included): " << std::fixed << pfencePerOp + pfenceParallelPerOp << std::endl;
 		
@@ -750,9 +792,10 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		l_combining_counter = 0;
 		pwbCounter = 0; pfenceCounter = 0; pwbParallelCounter = 0; pfenceParallelCounter = 0;
 		localPwbCounter = 0; localPfenceCounter = 0; localParallelPwbCounter = 0; localParallelPfenceCounter = 0;
-        return std::make_tuple(numPairs*2*NSEC_IN_SEC/median, pwbPerOp, pfencePerOp, pwbPerOp + pwbParallelPerOp, pfencePerOp + pfenceParallelPerOp, combiningPerOp);
+        max_stack_size = 0; stack_size_on_combine = 0; reduced = 0; opsize = 0;
+        return std::make_tuple(numPairs*2*NSEC_IN_SEC/median, pwbPerOp, pfencePerOp, pwbPerOp + pwbParallelPerOp, pfencePerOp + pfenceParallelPerOp, combiningPerOp, final_max, average_stack_size, final_reduced, final_opsize);
 	#endif
-	return std::make_tuple(numPairs*2*NSEC_IN_SEC/median, 0, 0, 0, 0, 0);
+	return std::make_tuple(numPairs*2*NSEC_IN_SEC/median, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 
@@ -769,7 +812,7 @@ int runSeveralTests() {
     const long numPairs = 1*MILLION;                                 // 1M is fast enough on the laptop
 	const int numSameOps = 100;
 
-    std::tuple<uint64_t, double, double, double, double, double> results[threadList.size()];
+    std::tuple<uint64_t, double, double, double, double, double, double, double, double, double> results[threadList.size()];
     std::string cName = "DFC";
     // Reset results
     std::memset(results, 0, sizeof(uint64_t)*threadList.size());
@@ -804,7 +847,7 @@ int runSeveralTests() {
     pdataFile.open(pdataFilename);
     pdataFile << "Threads\t";
     // Printf class names for each column
-    pdataFile << "OPS/Sec\t" << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t";
+    pdataFile << "OPS/Sec\t" << "DFC-PWB" << "\t" << "DFC-PFENCE" << "\t" << "DFC-PWB-T" << "\t" << "DFC-PFENCE-T" << "\t" << "DFC-COMBINING" << "\t" << "MAX-SIZE" << "\t" << "AVG-SIZE" << "\t" << "AVG-RED-PERC" << "\t" "AVG-PMEM-OPSIZE" << "\t";
     pdataFile << "\n";
     for (int it = 0; it < threadList.size(); it++) {
         pdataFile << threadList[it] << "\t";
@@ -814,6 +857,10 @@ int runSeveralTests() {
 		pdataFile << std::get<3>(results[it]) << "\t";
         pdataFile << std::get<4>(results[it]) << "\t";
 		pdataFile << std::get<5>(results[it]) << "\t";
+        pdataFile << std::get<6>(results[it]) << "\t";
+        pdataFile << std::get<7>(results[it]) << "\t";
+        pdataFile << std::get<8>(results[it]) << "\t";
+        pdataFile << std::get<9>(results[it]) << "\t";
         pdataFile << "\n";
     }
     pdataFile.close();

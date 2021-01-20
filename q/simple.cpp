@@ -27,6 +27,8 @@
 #define N 80 // number of processes
 #define MILLION  1000000LL
 
+#define RANDOP true
+
 #define MAX_POOL_SIZE 4000  // number of nodes in the pool
 // #define MAX_POOL_SIZE 80  // number of nodes in the pool
 #define ACK -1
@@ -162,8 +164,8 @@ using pmem::obj::transaction;
 namespace examples
 {
 
-    struct queue_data {
-        p<int64_t> front, rear;
+    struct stack_data {
+        p<int64_t> top;
         p<int64_t> data[SIZE];
     };
 
@@ -174,7 +176,7 @@ namespace examples
  * libpmemobj C++ API. It demonstrates the basic features of persistent_ptr<>
  * and p<> classes.
  */
-    class pmem_queue {
+    class pmem_stack {
 
     public:
         /*
@@ -183,17 +185,14 @@ namespace examples
 
         // Check if the queue is full
         bool isFull() {
-            if (q->front == 0 && q->rear == SIZE - 1) {
-                return true;
-            }
-            if (q->front == q->rear + 1) {
+            if (s->top == SIZE) {
                 return true;
             }
             return false;
         }
         // Check if the queue is empty
         bool isEmpty() {
-            if (q->front == -1)
+            if (s->top == -1)
                 return true;
             else
                 return false;
@@ -204,13 +203,12 @@ namespace examples
         {
             std::lock_guard<std::mutex>guard(*mutex);
             if (isFull()) {
-                std::cout << "Queue is full";
+                std::cout << "Stack is full";
             } else {
-                if (q->front == -1) q->front = 0;
-                q->rear = (q->rear + 1) % SIZE;
-                q->data[q->rear] = value;
-                PWB(&q->data[q->rear]);
-                PWB(&q->rear);
+                s->data[s->top + 1] = value;
+                PWB(&s->data[s->top + 1]);
+                s->top = s->top + 1;
+                PWB(&s->top);
                 PFENCE();
                 //std::cout << std::endl << "Inserted " << element << std::endl;
             }
@@ -225,21 +223,12 @@ namespace examples
             std::lock_guard<std::mutex>guard(*mutex);
             int element;
             if (isEmpty()) {
-                std::cout << "Queue is empty" << std::endl;
+                //std::cout << "Stack is empty" << std::endl;
                 return (-1);
             } else {
-                element = q->data[q->front];
-                if (q->front == q->rear) {
-                    q->front = -1;
-                    q->rear = -1;
-                    PWB(&q->rear);
-                }
-                    // Q has only one element,
-                    // so we reset the queue after deleting it.
-                else {
-                    q->front = (q->front + 1) % SIZE;
-                }
-                PWB(&q->front);
+                element = s->data[s->top];
+                s->top = s->top - 1;
+                PWB(&s->top);
                 PFENCE();
                 return (element);
             }
@@ -255,28 +244,27 @@ namespace examples
 //                std::cout << n->value << std::endl;
 //        }
 
-        pmem_queue(pool<examples::queue_data>& pool_base, persistent_ptr<queue_data> data)  : p(pool_base), q(data) {
+        pmem_stack(pool<examples::stack_data>& pool_base, persistent_ptr<stack_data> data)  : p(pool_base), s(data) {
             transaction::run(p, [&] {
-                q = make_persistent<queue_data>();
-                q->front = -1;
-                q->rear = -1;
+                s = make_persistent<stack_data>();
+                s->top = -1;
             });
             mutex = std::make_shared<std::mutex>();
         }
 
-        pmem_queue() = default;
+        pmem_stack() = default;
 
-        pmem_queue& operator=(const pmem_queue&) = default;
+        pmem_stack& operator=(const pmem_stack&) = default;
 
-//        ~pmem_queue() {
+//        ~pmem_stack() {
 //            transaction::run(p, [&] {
-//                delete_persistent<queue_data>(q);
+//                delete_persistent<stack_data>(s);
 //            });
 //        }
 
     private:
-        pool<examples::queue_data> p;
-        persistent_ptr<queue_data> q;
+        pool<examples::stack_data> p;
+        persistent_ptr<stack_data> s;
         std::shared_ptr<std::mutex> mutex;
 
     };
@@ -295,11 +283,11 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
     const uint64_t kNumElements = 0; // Number of initial items in the stack
     static const long long NSEC_IN_SEC = 1000000000LL;
 
-    pool<examples::queue_data> p;
-    examples::pmem_queue q;
-//    auto p = pool<examples::queue_data>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
-//    examples::pmem_queue q(p, p.root());
-    //persistent_ptr<examples::pmem_queue> q(p.root());
+    pool<examples::stack_data> p;
+    examples::pmem_stack q;
+//    auto p = pool<examples::stack_data>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
+//    examples::pmem_stack s(p, p.root());
+    //persistent_ptr<examples::pmem_stack> s(p.root());
 
     size_t params [N];
     size_t ops [N];
@@ -382,11 +370,11 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
     for (int irun = 0; irun < numRuns; irun++) {
         NN = numThreads;
 
-//        p = pool<examples::pmem_queue>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
-//        q = p.root();
-//        transaction_allocations(q, p);
-        p = pool<examples::queue_data>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
-        q = examples::pmem_queue(p, p.root());
+//        p = pool<examples::pmem_stack>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
+//        s = p.root();
+//        transaction_allocations(s, p);
+        p = pool<examples::stack_data>::create("/mnt/ram/data", LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
+        q = examples::pmem_stack(p, p.root());
         std::cout << "Finished allocating!" << std::endl;
 
         // Fill the queue with an initial amount of nodes
@@ -538,15 +526,15 @@ int old_main(int argc, char *argv[])
 
     queue_op op = parse_queue_op(argv[2]);
 
-    pool<examples::pmem_queue> pop;
-    persistent_ptr<examples::pmem_queue> q(pop.root());
+    pool<examples::pmem_stack> pop;
+    persistent_ptr<examples::pmem_stack> q(pop.root());
 
     try {
         if (file_exists(path) != 0) {
-            pop = pool<examples::pmem_queue>::create(
+            pop = pool<examples::pmem_stack>::create(
                     path, LAYOUT, PMEMOBJ_MIN_POOL, (S_IWUSR | S_IRUSR));
         } else {
-            pop = pool<examples::pmem_queue>::open(path, LAYOUT);
+            pop = pool<examples::pmem_stack>::open(path, LAYOUT);
         }
         q = pop.root();
     } catch (const pmem::pool_error &e) {
@@ -581,7 +569,7 @@ int old_main(int argc, char *argv[])
             }
             break;
         case QUEUE_SHOW:
-            //q->show();
+            //s->show();
             break;
         default:
             std::cerr << "Invalid queue operation" << std::endl;
