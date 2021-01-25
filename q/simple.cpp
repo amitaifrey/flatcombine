@@ -27,7 +27,7 @@
 #define N 80 // number of processes
 #define MILLION  1000000LL
 
-#define RANDOP true
+//#define RANDOP true
 
 #define MAX_POOL_SIZE 4000  // number of nodes in the pool
 // #define MAX_POOL_SIZE 80  // number of nodes in the pool
